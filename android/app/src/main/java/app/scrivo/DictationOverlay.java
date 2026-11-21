@@ -69,8 +69,21 @@ final class DictationOverlay extends LinearLayout {
         // The X, the waves and the check stay where they are: the bar grows upward when
         // words appear, so a finger already going for the check still lands on it.
         p.gravity=Gravity.RIGHT|Gravity.CENTER_VERTICAL;place(p);
+        // Android binds the typing helper by itself after a restart or an update, which builds
+        // this bubble again; a dictation cut off by the restart must not come back stuck open.
+        BubbleService.forgetStaleState(service);
         setAlpha(RESTING);windows.addView(this,p);state(owner.getSharedPreferences("dictation",Context.MODE_PRIVATE).getString("state","Ready"));
+        IntentFilter screen=new IntentFilter(Intent.ACTION_USER_PRESENT);screen.addAction(Intent.ACTION_SCREEN_ON);screen.addAction(Intent.ACTION_SCREEN_OFF);
+        try{service.registerReceiver(unlocked,screen);watching=true;}catch(RuntimeException unavailable){/* window events still refresh it */}
     }
+    /**
+     * Hidden on the lock screen; back the moment he unlocks, even when unlocking sends the
+     * helper no window event (seen as a missing bubble until something else changed on screen).
+     */
+    private final BroadcastReceiver unlocked=new BroadcastReceiver(){
+        @Override public void onReceive(Context c,Intent i){refresh();main.postDelayed(DictationOverlay.this::refresh,800);}
+    };
+    private boolean watching;
     private android.content.SharedPreferences saved(){return owner.getSharedPreferences("dictation",Context.MODE_PRIVATE);}
     /**
      * Width and height the control may use, inside the status and navigation bars. When the
@@ -220,7 +233,9 @@ final class DictationOverlay extends LinearLayout {
         wordsBox.post(()->wordsBox.smoothScrollTo(0,words.getHeight()));
     }
     void level(float value){waves.heard(value);}
-    void close(){main.removeCallbacks(lift);if(settle!=null)settle.cancel();waves.run(false,false);if(isAttachedToWindow())windows.removeView(this);}
+    void close(){
+        if(watching){try{owner.unregisterReceiver(unlocked);}catch(RuntimeException gone){/* already gone */}watching=false;}
+        main.removeCallbacksAndMessages(null);if(settle!=null)settle.cancel();waves.run(false,false);if(isAttachedToWindow())windows.removeView(this);}
     /**
      * Sound bars that follow the voice. They are redrawn every frame: the newest bar
      * rises with the voice at once, then each bar slides across the middle and settles.

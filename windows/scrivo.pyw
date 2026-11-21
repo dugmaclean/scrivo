@@ -22,6 +22,10 @@ The finished words are pasted where the cursor is and stay on the clipboard, so
 with no text box selected they are simply ready to paste. A small teal icon by
 the clock names the keys and offers Quit.
 
+At sign-in Windows starts it through a small keeper (`--keep`), which starts it
+again within seconds if it ever stops or stops answering. Quit at the clock icon
+is kept until the Start menu entry or the next sign-in.
+
 Only the Python standard library and Windows' own interfaces are used.
 The log holds states and timings, never words.
 """
@@ -45,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dictation_client as dc
+import remote_screen as rs
 
 NAME = 'Scrivo'
 CONFIG = Path(os.environ.get('APPDATA', '.')) / NAME / 'config.json'
@@ -126,6 +131,28 @@ class NOTIFYICONDATAW(ctypes.Structure):
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [('vkCode', wt.DWORD), ('scanCode', wt.DWORD), ('flags', wt.DWORD), ('time', wt.DWORD),
                 ('dwExtraInfo', PTR)]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [('usUsagePage', wt.USHORT), ('usUsage', wt.USHORT), ('dwFlags', wt.DWORD),
+                ('hwndTarget', ctypes.c_void_p)]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [('dwType', wt.DWORD), ('dwSize', wt.DWORD), ('hDevice', ctypes.c_void_p), ('wParam', PTR)]
+
+
+class RAWKEYBOARD(ctypes.Structure):
+    _fields_ = [('MakeCode', wt.USHORT), ('Flags', wt.USHORT), ('Reserved', wt.USHORT), ('VKey', wt.USHORT),
+                ('Message', wt.UINT), ('ExtraInformation', wt.ULONG)]
+
+
+class RAWKEYBOARDINPUT(ctypes.Structure):
+    _fields_ = [('header', RAWINPUTHEADER), ('keyboard', RAWKEYBOARD), ('spare', ctypes.c_ubyte * 16)]
+
+
+WM_INPUT, WM_TIMER, RID_INPUT = 0x00FF, 0x0113, 0x10000003
+RIDEV_REMOVE, RIDEV_INPUTSINK = 0x0001, 0x0100
 
 
 class PROCESSENTRY32W(ctypes.Structure):
@@ -230,6 +257,11 @@ def _api():
     user32.CallNextHookEx.argtypes = [H, ctypes.c_int, PTR, ctypes.c_ssize_t]
     user32.CallNextHookEx.restype = ctypes.c_ssize_t
     user32.UnhookWindowsHookEx.argtypes = [H]
+    user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wt.UINT, wt.UINT]
+    user32.GetRegisteredRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), ctypes.POINTER(wt.UINT), wt.UINT]
+    user32.GetRegisteredRawInputDevices.restype = wt.UINT
+    user32.GetRawInputData.argtypes = [H, wt.UINT, ctypes.c_void_p, ctypes.POINTER(wt.UINT), wt.UINT]
+    user32.GetRawInputData.restype = wt.UINT
     user32.SetWindowPos.argtypes = [H, H, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
     user32.GetWindowRect.argtypes = [H, ctypes.POINTER(wt.RECT)]
     user32.GetClassNameW.argtypes = [H, wt.LPWSTR, ctypes.c_int]
@@ -300,6 +332,21 @@ def idle_seconds():
     if not user32.GetLastInputInfo(ctypes.byref(info)):
         return 0.0
     return ((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
+def last_input_mark():
+    """Windows' own mark of the latest keyboard or mouse use (any program's), or None."""
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    return int(info.dwTime) if user32.GetLastInputInfo(ctypes.byref(info)) else None
+
+
+def quiet_enough(idle, mark, quiet_since):
+    """Five minutes untouched, or nothing at all since the previous check's own presses ended.
+
+    A check presses keys itself, which Windows counts as use. The next check may follow it at
+    once only when Windows' mark of the latest use is still exactly the one that check left.
+    """
+    return idle >= 300 or (quiet_since is not None and mark is not None and mark == quiet_since)
 
 
 def desktop_open():
@@ -442,10 +489,12 @@ class Combo:
     def feed(self, vk, down):
         out = []
         if down:
+            if self.still_down:
+                # A key whose letting go never arrived (the lock screen or Ctrl+Alt+Del took it) is
+                # forgotten first, or every later press of it would look like the keyboard repeating.
+                self.held = {k for k in self.held if k == vk or self.still_down(k)}
             if vk in self.held:
                 return out                        # the keyboard repeating a held key
-            if self.still_down:
-                self.held = {k for k in self.held if self.still_down(k)}
             self.held.add(vk)
             mine = vk in CTRLS or vk in WINS
             others = [k for k in self.held if k not in CTRLS and k not in WINS]
@@ -468,15 +517,49 @@ class Combo:
         return out
 
 
-class Keys(threading.Thread):
-    """Owns the dictation keys: Ctrl+Windows through a keyboard watch, and Ctrl+Alt+Space.
+def raw_key(vkey, make, flags):
+    """One of Windows' raw keyboard reports -> (the key, pressed) as the older watch named it, or None.
 
-    Ctrl+Windows has no other key, so Windows cannot register it as a shortcut;
-    a low-level keyboard watch sees every key change instead and passes every key
-    on untouched. While the other dictation app is open the watch reports nothing (`combo_on`
-    is off) so that app alone answers its own keys. Esc is taken only while a piece
-    is being spoken.
+    Raw reports name both Ctrl keys 0x11 and both Shift keys 0x10; the side comes from the
+    report's extra flag or its scan code. 0xFF is half of an escaped sequence, not a key.
     """
+    if vkey in (0, 0xFF):
+        return None
+    e0 = bool(flags & 2)
+    if vkey == 0x11:
+        vkey = 0xA3 if e0 else 0xA2
+    elif vkey == 0x12:
+        vkey = 0xA5 if e0 else 0xA4
+    elif vkey == 0x10:
+        vkey = 0xA1 if make == 0x36 else 0xA0
+    return vkey, not flags & 1
+
+
+class Keys(threading.Thread):
+    """Owns the dictation keys: Ctrl+Windows through Windows' raw keyboard reports, and Ctrl+Alt+Space.
+
+    Ctrl+Windows has no other key, so Windows cannot register it as a shortcut. The
+    keys are read from Windows' raw keyboard reports, which come as ordinary queued
+    messages: Windows never drops them for being slow, unlike a low-level keyboard
+    watch, which Windows removes without a word the first time it answers late (that
+    can leave Ctrl+Windows unheard for hours). Every key goes on
+    to Windows untouched. Every few seconds the reports are checked and asked for
+    again if they have stopped; the low-level watch is kept only for a Windows that
+    refuses raw reports, and is then renewed every minute. While the other dictation app
+    is open nothing is reported (`combo_on` is off) so that app alone answers its own keys.
+    Esc is taken only while a piece is being spoken.
+
+    A remote screen (a game-streaming app such as Moonlight, set to capture system keys) keeps Ctrl and Windows from
+    the raw reports and from Windows' own key state while it is in front. Then a fresh
+    low-level watch goes ahead of Moonlight's own a moment after it comes to the front
+    and every two seconds after (`remote_screen.HeadWatch`), and reports the keys
+    instead; it passes every key on, so Moonlight still sends them to the remote computer.
+    The other dictation app cannot hear Ctrl+Windows in front of Moonlight, so there they
+    are answered even while it is open.
+    """
+    CHECK_MS = 3000                     # how often Windows is asked whether it still sends the keyboard
+    TIMER = 7
+    FRONT, FRONT_MS = 8, 250            # how often to look whether a remote screen is in front
 
     def __init__(self, choices, events):
         super().__init__(daemon=True)
@@ -484,25 +567,115 @@ class Keys(threading.Thread):
         self.combo, self.held, self.ready, self.tid = None, [], threading.Event(), 0
         self.watch = Combo(key_down)
         self.combo_on, self.watching, self.hook = False, False, None
+        self.how, self.hwnd, self.buffer = None, None, RAWKEYBOARDINPUT()
+        self.heard, self.pressed, self.restored, self.checks = 0, 0, 0, 0
+        self.since = time.monotonic()
+        self.head, self.remote, self.front, self.front_id = None, None, rs.HeadWatch(), self.FRONT
+
+    def _feed(self, vk, down):
+        now = time.monotonic()
+        self.heard += 1
+        for what in self.watch.feed(vk, down):
+            if not (self.combo_on or self.front.on):
+                continue                          # the other app's, except in Moonlight, where it cannot hear them
+            if what == 'down':
+                self.pressed += 1
+                # Windows would open Start when the Windows key comes up alone.
+                user32.PostThreadMessageW(self.tid, WM_APP + 3, 0, 0)
+                self.events.put(('shortcut', ('combo', self.watch.presses, now)))
+            elif what == 'other':
+                self.events.put(('other', self.watch.presses))
 
     def _key(self, code, kind, data):
+        """The low-level watch: ahead of a remote screen's own, or when Windows refuses raw reports."""
         try:
             if code == 0:
                 info = ctypes.cast(data, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 if info.dwExtraInfo != MINE and kind in (0x100, 0x101, 0x104, 0x105):
-                    now = time.monotonic()
-                    for what in self.watch.feed(info.vkCode, kind in (0x100, 0x104)):
-                        if not self.combo_on:
-                            continue
-                        if what == 'down':
-                            # Windows would open Start when the Windows key comes up alone.
-                            user32.PostThreadMessageW(self.tid, WM_APP + 3, 0, 0)
-                            self.events.put(('shortcut', ('combo', self.watch.presses, now)))
-                        elif what == 'other':
-                            self.events.put(('other', self.watch.presses))
+                    self._feed(info.vkCode, kind in (0x100, 0x104))
         except Exception:
             pass                                  # the keyboard must never wait on us
         return user32.CallNextHookEx(None, code, kind, data)
+
+    def _raw(self, handle):
+        if self.head:
+            return                                # the watch ahead of Moonlight's reports the keys now
+        size = wt.UINT(ctypes.sizeof(self.buffer))
+        got = user32.GetRawInputData(handle, RID_INPUT, ctypes.byref(self.buffer), ctypes.byref(size),
+                                     ctypes.sizeof(RAWINPUTHEADER))
+        if got in (0, 0xFFFFFFFF) or self.buffer.header.dwType != 1:
+            return
+        board = self.buffer.keyboard
+        if board.ExtraInformation == MINE:
+            return                                # our own presses: the Start mask and the paste
+        key = raw_key(board.VKey, board.MakeCode, board.Flags)
+        if key:
+            self._feed(*key)
+
+    def _ask(self, flags=RIDEV_INPUTSINK):
+        """Ask Windows for every keyboard report, even while another window is in front."""
+        device = RAWINPUTDEVICE(1, 6, flags, None if flags & RIDEV_REMOVE else self.hwnd)
+        return bool(user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(RAWINPUTDEVICE)))
+
+    def asked(self):
+        """True while Windows still sends this program the keyboard reports."""
+        devices, count = (RAWINPUTDEVICE * 8)(), wt.UINT(8)
+        n = user32.GetRegisteredRawInputDevices(devices, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICE))
+        if n == 0xFFFFFFFF:
+            return False
+        return any(d.usUsagePage == 1 and d.usUsage == 6 and d.dwFlags & RIDEV_INPUTSINK and d.hwndTarget == self.hwnd
+                   for d in devices[:n])
+
+    def _check(self):
+        """Every few seconds: is the keyboard still reaching us? If not, ask again at once."""
+        self.checks += 1
+        if self.how == 'raw' and not self.asked():
+            back = self._ask()
+            self.restored += 1
+            log.info('keyboard watch was lost; asked Windows again: %s', back and self.asked())
+        elif self.how == 'hook' and self.checks % 20 == 0:
+            # Windows removes a late low-level watch without telling it: put a fresh one in every minute.
+            fresh = user32.SetWindowsHookExW(13, self.proc, kernel32.GetModuleHandleW(None), 0)
+            if fresh:
+                old, self.hook = self.hook, fresh
+                if old:
+                    user32.UnhookWindowsHookEx(old)
+        if time.monotonic() - self.since >= 3600:
+            # States only: whether any key reached us, how often the dictation keys were pressed.
+            log.info('keyboard watch (%s) this hour: keys heard=%s, dictation keys pressed %d times, watch restored %d times',
+                     self.how, self.heard > 0, self.pressed, self.restored)
+            self.heard, self.pressed, self.since = 0, 0, time.monotonic()
+
+    def _front(self):
+        """A few times a second: with a remote screen in front, keep our watch ahead of its own."""
+        self.remote = rs.remote_in_front()
+        act = self.front.tick(time.monotonic(), bool(self.remote))
+        if act == 'install':
+            fresh = user32.SetWindowsHookExW(13, self.proc, kernel32.GetModuleHandleW(None), 0)
+            if not fresh:
+                return
+            if self.how == 'hook':
+                old, self.hook = self.hook, fresh
+                first = self.watch.still_down is key_down
+            else:
+                old, self.head = self.head, fresh
+                first = old is None
+            if old:
+                user32.UnhookWindowsHookEx(old)
+            if first:
+                # Moonlight keeps the keys it takes out of Windows' own key state: trust our watch for those.
+                self.watch.still_down = lambda vk: vk in rs.CAPTURED or key_down(vk)
+                log.info('%s in front: keyboard watch put ahead of its own', self.remote)
+        elif act == 'remove':
+            if self.head:
+                user32.UnhookWindowsHookEx(self.head)
+                self.head = None
+            self.watch.still_down = key_down
+            log.info('remote screen left the front: usual keyboard watch')
+
+    def drop(self):
+        """For the installer's check only: let go of the keyboard as Windows might, to see it come back."""
+        user32.PostThreadMessageW(self.tid, WM_APP + 4, 0, 0)
 
     def run(self):
         self.tid = kernel32.GetCurrentThreadId()
@@ -517,30 +690,70 @@ class Keys(threading.Thread):
                 self.combo, self.held = text, held
                 break
         self.proc = HOOKPROC(self._key)
-        self.hook = user32.SetWindowsHookExW(13, self.proc, kernel32.GetModuleHandleW(None), 0)
-        self.watching = bool(self.hook)
-        log.info('keyboard watch for %s: %s', COMBO, self.watching)
+        try:
+            self.window_proc = WNDPROC(lambda hwnd, msg, wparam, lparam: user32.DefWindowProcW(hwnd, msg, wparam, lparam))
+            kind = WNDCLASSW()
+            kind.lpfnWndProc, kind.hInstance = self.window_proc, kernel32.GetModuleHandleW(None)
+            kind.lpszClassName = 'ScrivoKeys%x' % id(self)    # a restarted watch gets its own
+            user32.RegisterClassW(ctypes.byref(kind))
+            # Never shown: it only receives Windows' keyboard reports.
+            self.hwnd = user32.CreateWindowExW(0x00000080, kind.lpszClassName, NAME, 0x80000000, 0, 0, 0, 0,
+                                               None, None, kind.hInstance, None)
+            if self.hwnd and self._ask() and self.asked():
+                self.how = 'raw'
+        except Exception:
+            log.info('keyboard reports: %s', traceback.format_exc(limit=2))
+        if not self.how:
+            self.proc = HOOKPROC(self._key)
+            self.hook = user32.SetWindowsHookExW(13, self.proc, kernel32.GetModuleHandleW(None), 0)
+            self.how = 'hook' if self.hook else None
+        self.watching = bool(self.how)
+        log.info('keyboard watch for %s: %s (%s)', COMBO, self.watching,
+                 {'raw': "Windows' raw keyboard reports", 'hook': 'low-level watch'}.get(self.how, 'none'))
+        if self.hwnd:
+            user32.SetTimer(self.hwnd, self.TIMER, self.CHECK_MS, None)
+        made = user32.SetTimer(self.hwnd, self.FRONT, self.FRONT_MS, None)
+        self.front_id = self.FRONT if self.hwnd else made     # without a window Windows picks the number
         self.ready.set()
         if not self.combo and not self.watching:
             return
         while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            if message.message == WM_HOTKEY:
-                if message.wParam == 1:
-                    self.events.put(('shortcut', ('hotkey', 0, time.monotonic())))
-                else:
-                    self.events.put(('escape', None))
-            elif message.message == WM_APP + 1:
-                user32.RegisterHotKey(None, 2, 0x4000, 0x1B)
-            elif message.message == WM_APP + 2:
-                user32.UnregisterHotKey(None, 2)
-            elif message.message == WM_APP + 3 and key_down(0x5B) | key_down(0x5C):
-                mask = (INPUT * 2)()
-                for item, up in zip(mask, (0, 2)):
-                    item.type = 1
-                    item.u.ki = KEYBDINPUT(MASK, 0, up, 0, MINE)
-                user32.SendInput(2, mask, ctypes.sizeof(INPUT))
+            kind = message.message
+            try:
+                if kind == WM_INPUT:
+                    self._raw(ctypes.c_void_p(message.lParam & 0xFFFFFFFFFFFFFFFF))
+                elif kind == WM_TIMER and message.wParam == self.TIMER:
+                    self._check()
+                    continue
+                elif kind == WM_TIMER and message.wParam == self.front_id:
+                    self._front()
+                    continue
+                elif kind == WM_HOTKEY:
+                    if message.wParam == 1:
+                        self.events.put(('shortcut', ('hotkey', 0, time.monotonic())))
+                    else:
+                        self.events.put(('escape', None))
+                elif kind == WM_APP + 1:
+                    user32.RegisterHotKey(None, 2, 0x4000, 0x1B)
+                elif kind == WM_APP + 2:
+                    user32.UnregisterHotKey(None, 2)
+                elif kind == WM_APP + 3 and key_down(0x5B) | key_down(0x5C):
+                    mask = (INPUT * 2)()
+                    for item, up in zip(mask, (0, 2)):
+                        item.type = 1
+                        item.u.ki = KEYBDINPUT(MASK, 0, up, 0, MINE)
+                    user32.SendInput(2, mask, ctypes.sizeof(INPUT))
+                elif kind == WM_APP + 4 and self.how == 'raw':
+                    self._ask(RIDEV_REMOVE)
+                    log.info('keyboard watch let go on purpose by the check: %s', not self.asked())
+                if message.hWnd:
+                    user32.DispatchMessageW(ctypes.byref(message))   # Windows tidies each raw report here
+            except Exception:
+                log.info('keyboard watch: %s', traceback.format_exc(limit=2))
         if self.hook:
             user32.UnhookWindowsHookEx(self.hook)
+        if self.head:
+            user32.UnhookWindowsHookEx(self.head)
 
     def escape(self, on):
         user32.PostThreadMessageW(self.tid, WM_APP + (1 if on else 2), 0, 0)
@@ -558,6 +771,8 @@ class Keys(threading.Thread):
         return bool(self.held) and all(key_down(vk) for vk in self.held)
 
     def any_down(self):
+        if self.remote and set(self.watch.held) & rs.CAPTURED:
+            return True                       # held in Moonlight, where Windows' key state cannot see them
         return any(key_down(vk) for vk in self.held + list(VKS.values()) + [0x5C, 0xA2, 0xA3])
 
 
@@ -1325,6 +1540,9 @@ class App:
             self.watched += 1
             if self.watched % 4 == 0:
                 self._other_check()
+                self._keys_alive()
+            if self.watched % 20 == 1:
+                alive()                  # tells the keeper this program still answers
             self.full = full_screen()
             self._pill_now()
             if self.watched % 4 == 0 and self.pill.visible:
@@ -1332,6 +1550,17 @@ class App:
         except Exception:
             log.info('watch: %s', traceback.format_exc(limit=2))
         self.root.after(500, self._watch)
+
+    def _keys_alive(self):
+        """A keyboard watch that worked and then stopped is started again straight away."""
+        old = self.keys
+        if old.is_alive() or not old.ready.is_set() or not old.watching:
+            return
+        self.keys = Keys(old.choices, self.events)
+        self.keys.combo_on = old.combo_on
+        self.keys.start()
+        self.keys.ready.wait(3)
+        log.info('keyboard watch had stopped; started again: %s', self.keys.watching)
 
     def _pill_now(self):
         want = (self.show_bar and self.keys.combo_on and self.keys.watching and not self.full
@@ -1350,6 +1579,12 @@ class App:
             self.cancel()
         if self.tray:
             self.tray.close()
+        if why.startswith('Quit was chosen'):
+            # The keeper then waits for the Start menu entry instead of starting it again.
+            try:
+                (LOCAL / 'quit-chosen').write_text('Quit was chosen at the clock icon\n', encoding='utf-8')
+            except OSError:
+                pass
         log.info('closed: %s', why)
         self.root.destroy()
 
@@ -1456,11 +1691,29 @@ class App:
             self.root.after(20, lambda: self._deliver(text, give_up))
             return
         copied = clipboard(text + ' ')
+        remote = self.keys.remote and rs.remote_in_front()
+        if remote:
+            # Moonlight sends key presses to the remote computer but not this computer's clipboard,
+            # so Ctrl+V would paste the remote computer's own: type the words there key by key.
+            def typing():
+                got = rs.type_into(text + ' ', MINE, INPUT, KEYBDINPUT)
+                self.events.put(('call', lambda: self._typed(remote, got, copied)))
+            threading.Thread(target=typing, daemon=True).start()
+            return
         sent = copied and press((0x11, True), (0x56, True), (0x56, False), (0x11, False))
         log.info('delivery: clipboard=%s paste_sent=%s', bool(copied), bool(sent))
         if not copied:
             self._message('Could not reach the clipboard', 4)
             return
+        self._rest()
+        if self.pasted:
+            self.pasted()
+
+    def _typed(self, remote, got, copied):
+        typed, no_key, finished = got
+        self.last_typed = {'into': remote, 'characters': typed, 'without_a_key': no_key, 'finished': finished}
+        log.info('delivery: typed into %s characters=%d without_a_key=%d finished=%s clipboard=%s',
+                 remote, typed, no_key, finished, bool(copied))
         self._rest()
         if self.pasted:
             self.pasted()
@@ -1534,12 +1787,117 @@ def setup_log():
     log.setLevel(logging.INFO)
 
 
+def alive():
+    """The program's heartbeat: the keeper starts it again if this stops for a minute and a half."""
+    try:
+        (LOCAL / 'alive').write_text('%.0f\n' % time.time(), encoding='utf-8')
+    except OSError:
+        pass
+
+
+HUNG_SECONDS = 90          # no heartbeat this long: the keeper ends the program and starts it again
+QUICK_STOPS = 5            # stopped this many times within ten minutes: wait five minutes, then go on
+
+
+def keeper_choice(code, quit_chosen):
+    """What the keeper does when the dictation program ends: 'restart', 'wait' or 'end'.
+
+    Code 0 is a deliberate ending. After Quit at the clock icon it waits, so the Start
+    menu entry can start dictation again; otherwise (the installer asked, another copy
+    already runs) the keeper ends too. Anything else, a crash, an error or a hang,
+    starts the program again.
+    """
+    if code == 0:
+        return 'wait' if quit_chosen else 'end'
+    return 'restart'
+
+
+def heartbeat_stale(now, started, beat, limit=HUNG_SECONDS):
+    """True when the running program has not written its heartbeat for `limit` seconds."""
+    return now - max(started, beat or 0) > limit
+
+
+def keep(script):
+    """Keep dictation running for the whole sign-in: start it, and start it again if it ever stops.
+
+    The sign-in task runs this. It owns no window, no keys and no microphone; it only
+    starts the dictation program and watches it end or stop answering.
+    """
+    import subprocess
+    keeper_log = logging.getLogger('keeper')
+    LOCAL.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(LOCAL / 'keeper-log.txt', maxBytes=100_000, backupCount=1,
+                                                   encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    keeper_log.addHandler(handler)
+    keeper_log.setLevel(logging.INFO)
+    asked = LOCAL / 'start-request'
+    chosen = LOCAL / 'quit-chosen'
+    handle = kernel32.CreateMutexW(None, False, 'Local\\ScrivoKeeper')
+    if not handle or ctypes.get_last_error() == 183:
+        asked.write_text('start\n', encoding='utf-8')      # the keeper already running starts it
+        return 0
+    chosen.unlink(missing_ok=True)                        # a new sign-in or the Start menu: dictation on
+    asked.unlink(missing_ok=True)
+    keeper_log.info('keeper started')
+    stops = collections.deque(maxlen=QUICK_STOPS)
+    while True:
+        if chosen.exists():
+            if asked.exists():
+                chosen.unlink(missing_ok=True)
+                asked.unlink(missing_ok=True)
+                keeper_log.info('started again from the Start menu')
+            else:
+                time.sleep(1)
+                continue
+        if len(stops) == QUICK_STOPS and time.monotonic() - stops[0] < 600:
+            keeper_log.info('stopped %d times in ten minutes; waiting five minutes', QUICK_STOPS)
+            time.sleep(300)
+            stops.clear()
+        started = time.time()
+        child = subprocess.Popen([sys.executable, script], cwd=str(Path(script).parent), close_fds=True)
+        keeper_log.info('dictation started (process %d)', child.pid)
+        code = None
+        while code is None:
+            time.sleep(2)
+            code = child.poll()
+            if code is None:
+                try:
+                    beat = (LOCAL / 'alive').stat().st_mtime
+                except OSError:
+                    beat = None
+                if heartbeat_stale(time.time(), started, beat):
+                    keeper_log.info('dictation stopped answering for %d seconds; ending it', HUNG_SECONDS)
+                    child.kill()
+                    child.wait(10)
+                    code = 'not answering'
+        choice = keeper_choice(code, chosen.exists())
+        keeper_log.info('dictation ended (%s): %s', code, {'restart': 'starting it again', 'wait': 'Quit was chosen; '
+                        'waiting for the Start menu entry', 'end': 'the keeper ends too'}[choice])
+        if choice == 'end':
+            return 0
+        if choice == 'restart':
+            stops.append(time.monotonic())
+            time.sleep(2)
+
+
 def only_one():
     handle = kernel32.CreateMutexW(None, False, 'Local\\ScrivoSingleInstance')
     return handle and ctypes.get_last_error() != 183
 
 
 def take_focus(hwnd):
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)                # brought back from the taskbar first
+    if user32.SetForegroundWindow(hwnd) and user32.GetForegroundWindow() == hwnd:
+        return True
+    # Windows lets the program that made the last keyboard input choose the front window. An
+    # unassigned key, marked as ours so the watch ignores it, gives the check that right.
+    nudge = (INPUT * 2)()
+    for item, up in zip(nudge, (0, 2)):
+        item.type = 1
+        item.u.ki = KEYBDINPUT(MASK, 0, up, 0, MINE)
+    user32.SendInput(2, nudge, ctypes.sizeof(INPUT))
     if user32.SetForegroundWindow(hwnd) and user32.GetForegroundWindow() == hwnd:
         return True
     other = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
@@ -1551,22 +1909,96 @@ def take_focus(hwnd):
     return user32.GetForegroundWindow() == hwnd
 
 
-def self_check(config, sample, out, expected):
+def moonlight_window():
+    """Moonlight's streaming window (the one showing the remote computer), or None."""
+    found = []
+    each = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def look(hwnd, _):
+        kind = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, kind, 64)
+        if (kind.value == 'SDL_app' and user32.IsWindowVisible(hwnd)
+                and rs.REMOTE.get(rs.window_program(hwnd)) == 'Moonlight'):
+            found.append(hwnd)
+        return True
+    user32.EnumWindows(each(look), 0)
+    return found[0] if found else None
+
+
+def windows_of(kind, program=None):
+    """Visible top windows of this class (and program), newest first as Windows lists them."""
+    found = []
+    each = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def look(hwnd, _):
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, name, 64)
+        if name.value == kind and user32.IsWindowVisible(hwnd) and (not program or rs.window_program(hwnd) == program):
+            found.append(hwnd)
+        return True
+    user32.EnumWindows(each(look), 0)
+    return found
+
+
+def window_title(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(wt.HWND(hwnd), buf, 256)
+    return buf.value
+
+
+def text_box_in(hwnd):
+    """Notepad's own text box inside its window, or None."""
+    found = []
+    each = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def look(child, _):
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(child, name, 64)
+        if name.value in ('RichEditD2DPT', 'Edit'):
+            found.append(child)
+            return False
+        return True
+    user32.EnumChildWindows(hwnd, each(look), 0)
+    return found[0] if found else None
+
+
+def box_text(hwnd, new=None):
+    """The words in a text box; with `new`, put those words there instead."""
+    if new is not None:
+        buf = ctypes.create_unicode_buffer(new)
+        return user32.SendMessageW(wt.HWND(hwnd), wt.UINT(0x000C), wt.WPARAM(0), wt.LPARAM(ctypes.addressof(buf)))
+    size = user32.SendMessageW(wt.HWND(hwnd), wt.UINT(0x000E), wt.WPARAM(0), wt.LPARAM(0))      # its length
+    buf = ctypes.create_unicode_buffer(size + 2)
+    user32.SendMessageW(wt.HWND(hwnd), wt.UINT(0x000D), wt.WPARAM(size + 1), wt.LPARAM(ctypes.addressof(buf)))
+    return buf.value
+
+
+def self_check(config, sample, out, expected, target='own', quiet_since=None):
     """The whole path on this desktop, only while nobody is using it.
 
     Opens a small text box of its own, presses the real shortcut, plays a saved
     made-up sentence in place of the microphone, presses the shortcut again and
     reads what landed in its own box. The clipboard and the window that was in
     front are put back. Nothing of the user's is typed into, read or changed.
+
+    With target 'notepad' Notepad opens a file of the check's own (never when the user has Notepad
+    open); only that file's tab is typed into, saved, read back and closed. Any of the user's own
+    tabs that Notepad brings back are never typed into or changed.
+
+    With target 'moonlight' the shortcut is pressed with Moonlight's window in front
+    instead; the words are typed into whatever is chosen on the remote computer, where the
+    installer has opened a small check window of its own and reads what arrived.
     """
     result = {'ran': False, 'idle_seconds': round(idle_seconds()), 'desktop_open': desktop_open()}
 
     def save():
+        result['last_input_mark'] = last_input_mark()      # the next check may follow only if nobody came since
         Path(out).write_text(json.dumps(result, indent=2), encoding='utf-8')
     if not result['desktop_open']:
         result['why'] = 'the screen is locked'
         return save()
-    if result['idle_seconds'] < 300:
+    result['followed_a_check'] = quiet_since is not None and last_input_mark() == quiet_since
+    if not quiet_enough(result['idle_seconds'], last_input_mark(), quiet_since):
         result['why'] = 'the computer is in use'
         return save()
     # The microphone itself: half a second, loudness only, nothing kept.
@@ -1596,31 +2028,98 @@ def self_check(config, sample, out, expected):
     marks = {}
 
     def tap():
-        if app.keys.combo_on and app.keys.watching:
-            # Ctrl+Windows as fingers press it: both down, a short moment, both up.
-            press((0xA2, True), (0x5B, True))
-            app.root.after(80, lambda: press((0x5B, False), (0xA2, False)))
+        if (app.keys.combo_on or target == 'moonlight') and app.keys.watching:
+            # Ctrl+Windows as fingers press it, scan codes and all: both down, a short moment, both up.
+            rs.send([(0xA2, 0x1D, False), (0x5B, 0x5B, False)], 0, INPUT, KEYBDINPUT)
+            app.root.after(80, lambda: rs.send([(0x5B, 0x5B, True), (0xA2, 0x1D, True)], 0, INPUT, KEYBDINPUT))
             return
         mods = [VKS[p] for p in app.keys.combo.split('+')[:-1]]
         key = shortcut(app.keys.combo)[1]
         press(*[(m, True) for m in mods], (key, True), (key, False), *[(m, False) for m in reversed(mods)])
 
     def begin():
+        result['target'] = target
+        if target == 'moonlight':
+            box.withdraw()
+            hwnd = moonlight_window()
+            if not hwnd:
+                result['why'] = 'Moonlight was not open'
+                return end()
+            marks['hwnd'] = hwnd
+            result['took_focus'] = bool(take_focus(hwnd))
+            if not result['took_focus']:
+                result['why'] = 'another window kept the keyboard'
+                return end()
+            # Moonlight puts its own keyboard watch in when it comes to the front; ours goes ahead of it.
+            return app.root.after(1500, started)
+        if target == 'notepad':
+            box.withdraw()
+            if windows_of('Notepad'):
+                result['why'] = 'Notepad was already open with work of its own'
+                return end()
+            import subprocess
+            marks['file'] = LOCAL / 'check' / 'notepad-check.txt'
+            marks['file'].write_text('', encoding='utf-8')
+            subprocess.Popen(['notepad.exe', str(marks['file'])])
+            marks['notepad_since'] = time.monotonic()
+            return app.root.after(300, notepad_open)
         box.update()
         hwnd = user32.GetParent(box.winfo_id()) or box.winfo_id()
+        marks['hwnd'] = hwnd
         result['took_focus'] = bool(take_focus(hwnd))
         entry.focus_force()
         if not result['took_focus']:
             result['why'] = 'another window kept the keyboard'
             return end()
+        started()
+
+    def notepad_open():
+        found = [h for h in windows_of('Notepad', 'notepad.exe') if 'notepad-check' in window_title(h)]
+        if not found:
+            if time.monotonic() - marks['notepad_since'] > 10:
+                result['why'] = 'Notepad did not open'
+                return end()
+            return app.root.after(300, notepad_open)
+        marks['hwnd'], marks['notepad'] = found[0], found[0]
+        result['took_focus'] = bool(take_focus(found[0]))
+        if not result['took_focus']:
+            result['why'] = 'another window kept the keyboard'
+            return end()
+        app.root.after(800, started)
+
+    def started():
+        if target == 'moonlight':
+            result['moonlight_in_front'] = user32.GetForegroundWindow() == marks['hwnd']
+            result['remote_seen'] = app.keys.remote
+            result['watch_ahead_of_moonlight'] = bool(app.keys.head) or (app.keys.how == 'hook' and bool(app.keys.remote))
         result['ran'] = True
         result['shortcut'] = app.keys.names()
         result['other_app_open'] = bool(app.other_open)
         result['tiny_bar_shown_before'] = app.pill.visible
+        result['keyboard_watch'] = app.keys.how
+        if app.keys.how == 'raw':
+            # Let go of the keyboard the way Windows might, and time how soon the watch asks again.
+            app.keys.drop()
+            marks['dropped'] = time.monotonic()
+            app.root.after(200, recovered)
+            return
+        go()
+
+    def recovered():
+        if app.keys.restored and app.keys.asked():
+            result['watch_recovered_seconds'] = round(time.monotonic() - marks['dropped'], 2)
+            return go()
+        if time.monotonic() - marks['dropped'] > 10:
+            result['watch_recovered_seconds'] = None
+            result['why'] = 'the keyboard watch did not come back'
+            return end()
+        app.root.after(200, recovered)
+
+    def go():
         marks['start'] = time.monotonic()
         tap()
         app.root.after(1500, lambda: result.__setitem__('bar_shown', app.bar.visible) or
-                       result.__setitem__('focus_kept_while_bar_shown', user32.GetForegroundWindow() == hwnd) or
+                       result.__setitem__('focus_kept_while_bar_shown', user32.GetForegroundWindow() == marks['hwnd']) or
                        result.__setitem__('clock_icon_shown', bool(app.tray and app.tray.shown)))
         app.root.after(60000, end)
 
@@ -1635,10 +2134,36 @@ def self_check(config, sample, out, expected):
         if 'ended' in marks:
             return
         marks['ended'] = True
-        text = entry.get()
-        result['words_landed'] = bool(text.strip())
-        result['landed_text'] = text       # the made-up check sentence, never real words
-        result['exact'] = text.strip() == expected
+        if target == 'moonlight':
+            result['typed'] = getattr(app, 'last_typed', None)   # what arrived is read on the remote computer
+        elif target == 'notepad':
+            hwnd, mine = marks.get('notepad'), False
+            if hwnd and take_focus(hwnd) and 'notepad-check' in window_title(hwnd):
+                mine = True                    # the check's own file is the tab in front
+                rs.send([(0xA2, 0x1D, False), (0x53, 0x1F, False), (0x53, 0x1F, True), (0xA2, 0x1D, True)],
+                        MINE, INPUT, KEYBDINPUT)          # Ctrl+S: saves only that file
+                time.sleep(1.2)
+            text = ''
+            if marks.get('file') and marks['file'].exists():
+                text = marks['file'].read_text(encoding='utf-8-sig', errors='replace')
+            result['words_landed'] = bool(text.strip())
+            result['landed_text'] = text       # the made-up check sentence, never real words
+            result['exact'] = text.strip() == expected
+            if mine:
+                rs.send([(0xA2, 0x1D, False), (0x57, 0x11, False), (0x57, 0x11, True), (0xA2, 0x1D, True)],
+                        MINE, INPUT, KEYBDINPUT)          # Ctrl+W: closes only that saved tab
+                time.sleep(0.6)
+            if hwnd and user32.IsWindow(hwnd) and not [h for h in windows_of('Notepad', 'notepad.exe')
+                                                       if 'notepad-check' in window_title(h)]:
+                user32.PostMessageW(hwnd, 0x0010, 0, 0)  # Notepad as it was: the user's tabs, if any, kept
+            result['notepad_left_open'] = bool(hwnd and user32.IsWindow(hwnd) and 'notepad-check' in window_title(hwnd))
+            if marks.get('file'):
+                marks['file'].unlink(missing_ok=True)
+        else:
+            text = entry.get()
+            result['words_landed'] = bool(text.strip())
+            result['landed_text'] = text       # the made-up check sentence, never real words
+            result['exact'] = text.strip() == expected
         if 'paste' in marks and 'finish' in marks:
             result['seconds_from_finish_to_paste'] = round(marks['paste'] - marks['finish'], 2)
         result['seconds_from_keys'] = dict(app.timing)
@@ -1661,6 +2186,8 @@ def self_check(config, sample, out, expected):
 
 def main(argv):
     _api()
+    if argv[1:2] == ['--keep']:
+        return keep(str(Path(__file__).resolve()))
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
@@ -1686,7 +2213,8 @@ def main(argv):
             return 0
         (LOCAL / 'quit').unlink(missing_ok=True)      # an old request to leave is not for this copy
         if argv[1:2] == ['--self-check']:
-            self_check(config, job['sample'], job['out'], job['expected'])
+            self_check(config, job['sample'], job['out'], job['expected'], job.get('target') or 'own',
+                       job.get('quiet_since'))
             return 0
         return App(config).run()
     except Exception:

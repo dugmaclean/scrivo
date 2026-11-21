@@ -32,6 +32,19 @@ public class BubbleService extends Service {
         TextTargetService.refreshBubble();return TextTargetService.current!=null;
     }
     public static void updateVisibility(){TextTargetService.refreshBubble();}
+    /** True only while this process really has the recording service; a restart starts it false. */
+    static volatile boolean running;
+    /**
+     * Nothing is recording or writing unless this service is alive. A phone restarted (or an
+     * app updated) in the middle of a dictation leaves "Listening" or "Writing" saved, which
+     * would bring the bubble back stuck open with nothing behind it and make the first tap miss.
+     */
+    static void forgetStaleState(Context context){
+        if(running)return;
+        android.content.SharedPreferences p=context.getSharedPreferences("dictation",MODE_PRIVATE);
+        String s=p.getString("state","Ready");
+        if("Listening".equals(s)||"Writing".equals(s)||"Recovering saved speech".equals(s))p.edit().putString("state","Ready").apply();
+    }
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService network=Executors.newSingleThreadExecutor();
     private volatile boolean recording;
@@ -45,7 +58,7 @@ public class BubbleService extends Service {
     public IBinder onBind(Intent intent){return null;}
 
     public void onCreate(){
-        super.onCreate();
+        super.onCreate();running=true;
         getSharedPreferences("dictation",MODE_PRIVATE).edit().putString("state","Ready").apply();
         NotificationManager nm=getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("dictation",getString(R.string.app_name),NotificationManager.IMPORTANCE_LOW));
@@ -191,5 +204,5 @@ public class BubbleService extends Service {
         }
         return START_STICKY;
     }
-    public void onDestroy(){generation++;if(liveUpload!=null)liveUpload.finish(false);destroyed=true;if(recording)stopRecording(false);network.shutdownNow();getSharedPreferences("dictation",MODE_PRIVATE).edit().putString("state","Ready").apply();super.onDestroy();}
+    public void onDestroy(){running=false;generation++;if(liveUpload!=null)liveUpload.finish(false);destroyed=true;if(recording)stopRecording(false);network.shutdownNow();getSharedPreferences("dictation",MODE_PRIVATE).edit().putString("state","Ready").apply();super.onDestroy();}
 }

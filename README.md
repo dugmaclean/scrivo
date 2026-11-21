@@ -131,12 +131,20 @@ The Windows client uses only Python's standard library (Python 3.11 or newer fro
    ```
 
    Notepad is fine for this file.
-3. Run `pythonw scrivo.pyw`. To start it at sign-in, put a shortcut to that command in your
-   Startup folder (`Win+R`, then `shell:startup`).
+3. Run `pythonw scrivo.pyw --keep`. The `--keep` option starts a small keeper that runs the
+   client and starts it again within seconds if it ever stops or stops answering (Quit at the
+   clock icon is respected until you start it again). To start it at sign-in, put a shortcut to
+   that command in your Startup folder (`Win+R`, then `shell:startup`).
 
 Hold Ctrl+Windows, speak and let go. A small teal icon by the clock names the keys and offers
 Quit. If another dictation app that also uses Ctrl+Windows is open, Scrivo leaves that key to
 it and answers Ctrl+Alt+Space instead, so nothing is ever typed twice.
+
+The keys are read from Windows' raw keyboard reports, which Windows never drops, and the
+keyboard watch is checked every few seconds and renewed if it stops. Game-streaming apps such
+as Moonlight, set to capture system keys, hide Ctrl and Windows from other programs while
+their window is in front; Scrivo then puts a fresh watch ahead of theirs, still passes every
+key on, and types the finished words as key presses so they reach the streamed computer.
 
 ## Privacy
 

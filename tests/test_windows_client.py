@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'windows'))
@@ -349,6 +350,88 @@ class CtrlWindowsKeys(unittest.TestCase):
         self.assertEqual(self.pd.OTHER_APP, 'wispr flow.exe')
 
 
+class KeyboardNeverGoesDeaf(unittest.TestCase):
+    """2026-11-20: Windows dropped the low-level keyboard watch and Ctrl+Windows did nothing for hours."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pd = program()
+
+    def test_raw_reports_name_each_side_like_the_old_watch(self):
+        raw = self.pd.raw_key
+        self.assertEqual(raw(0x11, 0x1D, 0), (0xA2, True))          # left Ctrl down
+        self.assertEqual(raw(0x11, 0x1D, 2 | 1), (0xA3, False))     # right Ctrl (extra flag) up
+        self.assertEqual(raw(0x5B, 0x5B, 2), (0x5B, True))          # left Windows key
+        self.assertEqual(raw(0x5C, 0x5C, 3), (0x5C, False))         # right Windows key up
+        self.assertEqual(raw(0x10, 0x36, 0), (0xA1, True))          # right Shift by its scan code
+        self.assertEqual(raw(0x10, 0x2A, 1), (0xA0, False))
+        self.assertEqual(raw(0x12, 0x38, 2), (0xA5, True))          # right Alt
+        self.assertIsNone(raw(0xFF, 0x2A, 0))                       # half of an escaped sequence
+        self.assertIsNone(raw(0, 0, 0))
+
+    def test_raw_reports_feed_the_same_ctrl_windows_rules(self):
+        c = self.pd.Combo()
+        out = []
+        for report in ((0x11, 0x1D, 0), (0x5B, 0x5B, 2), (0x5B, 0x5B, 3), (0x11, 0x1D, 1)):
+            out += c.feed(*self.pd.raw_key(*report))
+        self.assertEqual(out, ['down', 'up'])
+
+    def test_raw_reports_come_first_and_are_asked_for_again_when_lost(self):
+        import inspect
+        run = inspect.getsource(self.pd.Keys.run)
+        self.assertLess(run.index('self._ask()'), run.index('SetWindowsHookExW'))   # the old watch only as a fallback
+        self.assertIn('RIDEV_INPUTSINK', inspect.getsource(self.pd.Keys._ask))       # even with another window in front
+        check = inspect.getsource(self.pd.Keys._check)
+        self.assertIn('if self.how == \'raw\' and not self.asked()', check)
+        self.assertIn('back = self._ask()', check)
+        self.assertLessEqual(self.pd.Keys.CHECK_MS, 5000)                           # back within seconds
+
+    def test_our_own_presses_never_reach_the_watch(self):
+        import inspect
+        self.assertIn('board.ExtraInformation == MINE', inspect.getsource(self.pd.Keys._raw))
+
+    def test_a_ctrl_whose_letting_go_was_lost_does_not_block_the_next_press(self):
+        down = {0xA2: True, 0x5B: True}
+        c = self.pd.Combo(still_down=lambda vk: down.get(vk, False))
+        c.feed(0xA2, True)                    # Ctrl+Alt+Del: the secure screen took the letting go
+        c.feed(0xA4, True)
+        down.update({0xA4: False})
+        self.assertEqual(c.feed(0x5B, True), ['down'])
+
+    def test_a_stopped_watch_is_started_again(self):
+        import inspect
+        body = inspect.getsource(self.pd.App._keys_alive)
+        self.assertIn('self.keys = Keys(old.choices, self.events)', body)
+        self.assertIn('self._keys_alive()', inspect.getsource(self.pd.App._watch))
+
+
+class KeeperStartsItAgain(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.pd = program()
+
+    def test_a_crash_or_a_hang_starts_it_again(self):
+        self.assertEqual(self.pd.keeper_choice(1, False), 'restart')
+        self.assertEqual(self.pd.keeper_choice(-1, False), 'restart')
+        self.assertEqual(self.pd.keeper_choice('not answering', False), 'restart')
+        self.assertEqual(self.pd.keeper_choice(2, True), 'restart')
+
+    def test_quit_waits_for_the_start_menu_and_the_installer_ends_it(self):
+        self.assertEqual(self.pd.keeper_choice(0, True), 'wait')
+        self.assertEqual(self.pd.keeper_choice(0, False), 'end')
+
+    def test_no_heartbeat_for_ninety_seconds_is_a_hang(self):
+        stale = self.pd.heartbeat_stale
+        self.assertFalse(stale(1000, 950, None))           # just started, no heartbeat yet
+        self.assertFalse(stale(1000, 0, 950))
+        self.assertTrue(stale(1000, 0, 900))
+        self.assertTrue(stale(1000, 900, None))
+
+    def test_the_program_beats_and_quit_leaves_a_note(self):
+        import inspect
+        self.assertIn('alive()', inspect.getsource(self.pd.App._watch))
+        self.assertIn("'quit-chosen'", inspect.getsource(self.pd.App.close))
+        self.assertIn("argv[1:2] == ['--keep']", inspect.getsource(self.pd.main))
+
 class TinyBar(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -389,12 +472,119 @@ class TinyBar(unittest.TestCase):
                 seconds = audio.getnframes() / audio.getframerate()
             samples = [int.from_bytes(frames[i:i + 2], 'little', signed=True) for i in range(0, len(frames), 2)]
             self.assertLess(seconds, 0.2)                       # a cue, not a tune
-            self.assertLess(max(abs(v) for v in samples), 32767 * 0.16)   # quiet next to his voice
+            self.assertLess(max(abs(v) for v in samples), 32767 * 0.16)   # quiet next to a voice
             self.assertLess(abs(samples[-1]), 400)              # fades out: no click at the end
             made[name] = data
         self.assertEqual(len(set(made.values())), 3)           # three different cues
         self.assertLess(self.pd.SOUNDS['start'][0][0], self.pd.SOUNDS['start'][-1][0])    # start rises
         self.assertGreater(self.pd.SOUNDS['cancel'][0][0], self.pd.SOUNDS['cancel'][-1][0])  # cancel falls
+
+
+class MoonlightInFront(unittest.TestCase):
+    """2026-11-20: Moonlight, set to capture system keys, kept Ctrl+Windows from dictation while in front."""
+    @classmethod
+    def setUpClass(cls):
+        cls.pd = program()
+        cls.rs = cls.pd.rs
+
+    def test_words_become_us_keyboard_presses_with_scan_codes(self):
+        events = self.rs.keystrokes('Hi!')
+        SHIFT = self.rs.SHIFT
+        self.assertEqual([(vk, up) for vk, _, up in events],
+                         [(SHIFT, False), (0x48, False), (0x48, True), (SHIFT, True), (0x49, False), (0x49, True),
+                          (SHIFT, False), (0x31, False), (0x31, True), (SHIFT, True)])
+        self.assertTrue(all(scan for _, scan, _ in events))      # Moonlight reads the scan code, not the key name
+        typed = ''.join(chr(c) for c in range(32, 127))
+        self.assertEqual(self.rs.plain(typed), (typed, 0))       # every key on the US keyboard can be typed
+
+    def test_curly_quotes_and_dashes_become_plain_and_the_rest_is_counted(self):
+        self.assertEqual(self.rs.plain('He said \u201cdon\u2019t\u201d \u2014 caf\u00e9\u2026'),
+                         ('He said "don\'t" - cafe...', 0))
+        self.assertEqual(self.rs.plain('ok \u2603'), ('ok ', 1))
+
+    def test_our_watch_goes_ahead_a_moment_after_moonlight_comes_to_the_front_and_again_after(self):
+        h = self.rs.HeadWatch()
+        self.assertEqual([h.tick(t, True) for t in (0, 0.1, 0.35, 1.0, 2.4, 3.0, 4.4)],
+                         [None, None, 'install', None, 'install', None, 'install'])
+        self.assertEqual(h.tick(4.6, False), 'remove')
+        self.assertIsNone(h.tick(4.8, False))
+        self.assertIsNone(h.tick(5.0, True))                    # back in front: settles again first
+        self.assertEqual(h.tick(5.4, True), 'install')
+
+    def test_ctrl_windows_counts_while_windows_cannot_see_moonlights_keys(self):
+        seen = lambda vk: False                                  # Windows' key state with Moonlight in front
+        moonlight = self.pd.Combo(still_down=lambda vk: vk in self.rs.CAPTURED or seen(vk))
+        self.assertEqual(moonlight.feed(0xA2, True) + moonlight.feed(0x5B, True), ['down'])
+        self.assertEqual(moonlight.feed(0x5B, False), ['up'])
+        blind = self.pd.Combo(still_down=seen)                   # what the usual check alone would do
+        self.assertEqual(blind.feed(0xA2, True) + blind.feed(0x5B, True), [])
+
+    def keys(self, remote):
+        k = self.pd.Keys(['ctrl+alt+space'], __import__('queue').Queue())
+        k.how, k.tid, k.proc, k.front.SETTLE = 'raw', 1, object(), 0
+        self.pd.user32.SetWindowsHookExW.return_value = 77
+        self.rs_front = mock.patch.object(self.pd.rs, 'remote_in_front', lambda: remote)
+        return k
+
+    def test_with_moonlight_in_front_a_fresh_watch_reports_the_keys_and_goes_when_it_leaves(self):
+        k = self.keys('Moonlight')
+        with self.rs_front:
+            k._front()
+        self.assertEqual(k.head, 77)
+        self.assertIsNot(k.watch.still_down, self.pd.key_down)
+        self.assertTrue(k.watch.still_down(0xA2))                # Ctrl: our watch knows, Windows does not
+        k._raw(None)                                             # the raw reports are not counted twice
+        self.pd.user32.GetRawInputData.assert_not_called()
+        k.watch.held = {0xA2}
+        self.assertTrue(k.any_down())                            # words wait for Ctrl to come up
+        k.remote = None
+        with mock.patch.object(self.pd.rs, 'remote_in_front', lambda: None):
+            k._front()
+        self.assertIsNone(k.head)
+        self.assertIs(k.watch.still_down, self.pd.key_down)
+
+    def test_words_are_typed_into_moonlight_and_pasted_everywhere_else(self):
+        import inspect
+        deliver = inspect.getsource(self.pd.App._deliver)
+        self.assertLess(deliver.index('rs.type_into'), deliver.index('press((0x11, True), (0x56, True)'))
+        self.assertIn("clipboard(text + ' ')", deliver)          # on this computer's clipboard as well
+        self.assertIn('self._front()', inspect.getsource(self.pd.Keys.run))
+        self.assertLessEqual(self.pd.Keys.FRONT_MS, 500)
+
+
+class TheKeyboardThreadSurvivesItsOwnMessages(unittest.TestCase):
+    """2026-11-20: the first key press ended the keyboard thread (Windows' message names its window hWnd)."""
+    def test_the_message_loop_uses_windows_own_field_name_inside_its_guard(self):
+        import inspect
+        pd = program()
+        self.assertIn('hWnd', [name for name, _ in pd.wt.MSG._fields_])
+        run = inspect.getsource(pd.Keys.run)
+        self.assertNotIn('message.hwnd', run)
+        loop = run[run.index('while user32.GetMessageW'):]
+        self.assertLess(loop.index('try:'), loop.index('message.hWnd'))
+        self.assertLess(loop.index('message.hWnd'), loop.index('except Exception'))
+
+
+class ChecksFollowEachOther(unittest.TestCase):
+    """A check's own key presses count as use; the next may follow only if nobody came after it."""
+    def test_quiet_means_five_minutes_or_nothing_since_the_last_check(self):
+        quiet = program().quiet_enough
+        self.assertTrue(quiet(301, 5000, None))
+        self.assertFalse(quiet(12, 5000, None))
+        self.assertTrue(quiet(12, 5000, 5000))           # only the previous check's own presses
+        self.assertFalse(quiet(12, 5200, 5000))          # someone touched it after that check
+        self.assertFalse(quiet(12, None, 5000))
+
+
+class NotepadCheckTouchesOnlyItsOwnFile(unittest.TestCase):
+    def test_it_types_saves_and_closes_only_its_own_tab(self):
+        import inspect
+        body = inspect.getsource(program().self_check)
+        self.assertIn("subprocess.Popen(['notepad.exe', str(marks['file'])])", body)
+        self.assertIn("'notepad-check' in window_title(h)", body)               # typed into only when its tab is in front
+        self.assertLess(body.index("mine = True"), body.index('Ctrl+S: saves only that file'))
+        self.assertIn("if mine:", body)                                          # Ctrl+W only for its own saved tab
+        self.assertNotIn('box_text(edit, ', body)                               # never empties a text box
 
 
 if __name__ == '__main__':

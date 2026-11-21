@@ -65,6 +65,7 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle state){
         super.onCreate(state);
         prefs=getSharedPreferences("dictation",MODE_PRIVATE);
+        BubbleService.forgetStaleState(this);
         prefs.registerOnSharedPreferenceChangeListener(changed);
         BubbleService.prepare(this);
         show();load();
