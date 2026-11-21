@@ -4,7 +4,7 @@
 Ctrl+Windows on your computer, speak, and tidy text lands where your cursor is. Speech is
 recognized on your own server; the tidy-up is done by any model you choose, local by default.
 
-Looking for an open-source Wispr Flow clone, a private speech-to-text keyboard, or offline voice dictation you can run on your own computer? That is what Scrivo is.
+Looking for an open-source Wispr Flow clone (often searched as "Whisper Flow"), a free alternative to paid dictation apps, a private speech-to-text keyboard, or offline voice dictation you can run on your own computer? That is what Scrivo is.
 
 Scrivo is an independent project inspired by the experience of Wispr Flow. It is not
 affiliated with Wispr Flow or its makers. See [CREDITS.md](CREDITS.md).
@@ -41,7 +41,7 @@ test phone with made-up data.*
 ## 1. Run the server
 
 ```bash
-git clone https://github.com/YOUR-NAME/scrivo.git
+git clone https://github.com/dugmaclean/scrivo.git
 cd scrivo
 python3 -m venv .venv
 . .venv/bin/activate
