@@ -1,0 +1,4 @@
+<resources>
+ <color name="surface">#F5FAF8</color><color name="ink">#122F2B</color><color name="secondary">#49665E</color><color name="teal">#006D60</color><color name="on_teal">#FFFFFF</color><color name="soft">#E3F1EB</color>
+ <color name="line">#C9DED5</color><color name="press">#33006D60</color><color name="warn">#8A4300</color>
+</resources>

@@ -1,0 +1,37 @@
+{
+  "_readme": "Copy this file to scrivo.json and edit it. Each writer is any OpenAI-compatible chat endpoint. The first three are the default order: if one fails the next one tries, and if all fail you still get the recognized words. API keys are never written here: api_key_env names the environment variable that holds the key.",
+  "writers": [
+    {
+      "key": "home",
+      "label": "Local model (Ollama)",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "qwen2.5:7b-instruct",
+      "cloud": false
+    },
+    {
+      "key": "home-2",
+      "label": "Second local model (llama.cpp server)",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "local-model",
+      "cloud": false
+    },
+    {
+      "key": "claude-haiku",
+      "label": "Claude Haiku (cloud)",
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-haiku-5-5",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "cloud": true,
+      "company": "Anthropic"
+    },
+    {
+      "key": "openai-mini",
+      "label": "OpenAI mini model (cloud)",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY",
+      "cloud": true,
+      "company": "OpenAI"
+    }
+  ]
+}

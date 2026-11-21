@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Scrivo</string>
+    <string name="accessibility_description">Scrivo inserts your recording into the text box you selected. It reads the selected text box only to preserve your existing words. It does not send those existing words to the server. Password fields are excluded.</string>
+</resources>

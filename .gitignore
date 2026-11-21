@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+state/
+scrivo.json
+*.token
+android/.gradle/
+android/**/build/
+android/local.properties
+*.apk
+*.keystore
+*.jks
